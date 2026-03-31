@@ -1,0 +1,69 @@
+import datetime
+from pathlib import Path
+
+import yt_dlp
+
+
+def list_channel_videos(channel_url: str) -> list:
+    ydl_opts = {
+        "flat_playlist": True,
+        "extract_flat": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(channel_url, download=False)
+
+    entries = info.get("entries", [])
+    videos = []
+    for entry in entries:
+        if entry is None:
+            continue
+
+        raw_date = entry.get("upload_date")
+        if raw_date:
+            uploaded_at = datetime.datetime.strptime(raw_date, "%Y%m%d").date()
+        else:
+            uploaded_at = None
+
+        videos.append(
+            {
+                "video_id": entry.get("id"),
+                "title": entry.get("title"),
+                "url": entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}",
+                "channel": entry.get("channel") or info.get("channel") or info.get("uploader"),
+                "duration": entry.get("duration"),
+                "uploaded_at": uploaded_at,
+            }
+        )
+
+    return videos
+
+
+def download_audio(video_id: str, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(output_dir / f"{video_id}.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "quiet": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+            }
+        ],
+        "postprocessor_args": {
+            "FFmpegExtractAudio": ["-ar", "16000", "-ac", "1"],
+        },
+    }
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    wav_path = output_dir / f"{video_id}.wav"
+    return wav_path

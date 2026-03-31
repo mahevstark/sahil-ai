@@ -1,0 +1,11 @@
+.env
+audio_tmp/
+__pycache__/
+*.pyc
+*.pyo
+.omc/
+*.wav
+*.webm
+*.m4a
+.claude/
+test_out.txt

@@ -1,0 +1,7 @@
+yt-dlp
+faster-whisper
+openai>=1.0.0
+psycopg2-binary
+pgvector
+click
+python-dotenv

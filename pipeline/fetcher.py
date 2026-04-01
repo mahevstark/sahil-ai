@@ -41,6 +41,38 @@ def list_channel_videos(channel_url: str) -> list:
     return videos
 
 
+def fetch_video_meta(video_id: str) -> dict:
+    """Fetch title/channel/duration/date for a single video via yt-dlp."""
+    import datetime
+    import json
+    import shutil
+    import subprocess
+
+    ytdlp   = shutil.which("yt-dlp") or "yt-dlp"
+    url     = f"https://www.youtube.com/watch?v={video_id}"
+    fallback = {"video_id": video_id, "title": video_id, "channel": None,
+                "url": url, "duration": None, "uploaded_at": None}
+    r = subprocess.run(
+        [ytdlp, "--dump-json", "--no-playlist", url],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if r.returncode != 0:
+        return fallback
+    try:
+        data = json.loads(r.stdout)
+        raw  = data.get("upload_date")
+        return {
+            "video_id":    video_id,
+            "title":       data.get("title", video_id),
+            "channel":     data.get("channel") or data.get("uploader"),
+            "url":         url,
+            "duration":    data.get("duration"),
+            "uploaded_at": datetime.datetime.strptime(raw, "%Y%m%d").date() if raw else None,
+        }
+    except Exception:
+        return fallback
+
+
 def download_audio(video_id: str, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(output_dir / f"{video_id}.%(ext)s")

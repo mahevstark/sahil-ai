@@ -117,6 +117,40 @@ def _do_clear_queue(conn):
     print(f"  Removed {deleted} job(s) from the queue.")
 
 
+# ── Workers & benchmarks ───────────────────────────────────────────────────
+
+def _do_workers(conn):
+    from pipeline.storage import get_benchmarks, get_worker_nodes
+
+    workers = get_worker_nodes(conn)
+
+    print("\n  -- Registered Workers --")
+    if not workers:
+        print("    No workers registered yet.")
+    else:
+        print(f"    {'ID':<25} {'Status':<8} {'OS':<18} {'CPU':<30} {'RAM':>6}  Last seen")
+        print("    " + "-" * 100)
+        for w in workers:
+            last = str(w["last_heartbeat"])[:19] if w["last_heartbeat"] else "-"
+            os_  = (w["os"] or "-")[:17]
+            cpu  = (w["cpu"] or "-")[:29]
+            ram  = f"{w['ram_gb']} GB" if w["ram_gb"] else "-"
+            print(f"    {w['worker_id']:<25} {w['status']:<8} {os_:<18} {cpu:<30} {ram:>6}  {last}")
+
+    print("\n  -- Transcription Speed (WPM = words per minute processed) --")
+    rows = get_benchmarks(conn)
+    if not rows:
+        print("    No benchmark data yet — workers will record it after completing jobs.")
+    else:
+        print(f"    {'Worker':<25} {'Model':<10} {'Jobs':>4}  {'Avg WPM':>8}  {'Best WPM':>9}  {'Avg audio':>10}")
+        print("    " + "-" * 78)
+        for r in rows:
+            avg_audio = f"{r['avg_audio_mins']} min" if r["avg_audio_mins"] else "-"
+            print(f"    {r['worker_id']:<25} {r['model_size'] or '-':<10} {r['jobs']:>4}"
+                  f"  {r['avg_wpm']:>8}  {r['best_wpm']:>9}  {avg_audio:>10}")
+    print()
+
+
 # ── Status ─────────────────────────────────────────────────────────────────
 
 def _do_status(conn):
@@ -296,26 +330,50 @@ def _do_run(conn):
         meta = fetch_video_meta(video_id)
         print(f"  [{done+1}/{done + queued}] {meta.get('title') or video_id}", flush=True)
 
+        # Use a fresh connection per video so the long download/split phase
+        # (no DB activity) doesn't kill the shared menu-session connection.
+        # Both connections have TCP keepalives (set in get_connection()).
+        proc_conn = None
         try:
-            process_video(conn, model, model_size, meta)
-            with conn.cursor() as cur:
+            from pipeline.storage import get_connection as _mkconn
+            proc_conn = _mkconn()
+            process_video(proc_conn, model, model_size, meta)
+            with proc_conn.cursor() as cur:
                 cur.execute(
                     "UPDATE job_queue SET status='completed', completed_at=NOW() WHERE id=%s",
                     (job_id,)
                 )
-            conn.commit()
+            proc_conn.commit()
             done += 1
         except Exception as exc:
             print(f"       Error: {exc}", flush=True)
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE job_queue SET
-                        retries = retries + 1, error_msg = %s,
-                        worker_id = NULL, started_at = NULL,
-                        status = CASE WHEN retries + 1 >= 3 THEN 'failed' ELSE 'queued' END
-                    WHERE id = %s
-                """, (str(exc)[:500], job_id))
-            conn.commit()
+            if proc_conn:
+                try:
+                    proc_conn.rollback()
+                except Exception:
+                    pass
+            # Update error status — use a fresh conn in case proc_conn is dead
+            try:
+                from pipeline.storage import get_connection as _mkconn
+                err_conn = _mkconn()
+                with err_conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE job_queue SET
+                            retries = retries + 1, error_msg = %s,
+                            worker_id = NULL, started_at = NULL,
+                            status = CASE WHEN retries + 1 >= 3 THEN 'failed' ELSE 'queued' END
+                        WHERE id = %s
+                    """, (str(exc)[:500], job_id))
+                err_conn.commit()
+                err_conn.close()
+            except Exception:
+                pass
+        finally:
+            if proc_conn:
+                try:
+                    proc_conn.close()
+                except Exception:
+                    pass
 
 
 # ── Main interactive loop ──────────────────────────────────────────────────
@@ -335,6 +393,7 @@ def _interactive_mode():
         questionary.Choice("Queue videos for processing",            value="queue"),
         questionary.Choice("Process videos now (on this machine)",   value="run"),
         questionary.Choice("Check progress & worker status",         value="status"),
+        questionary.Choice("Workers & performance benchmarks",        value="workers"),
         questionary.Choice("Search videos by text",                  value="search"),
         questionary.Choice("Summarize a video",                      value="summarize"),
         questionary.Choice("Ask a question (answers from videos)",   value="ask"),
@@ -354,6 +413,7 @@ def _interactive_mode():
                 if action == "queue":             _do_queue(conn)
                 elif action == "run":             _do_run(conn)
                 elif action == "status":          _do_status(conn)
+                elif action == "workers":         _do_workers(conn)
                 elif action == "search":          _do_search(conn)
                 elif action == "summarize":       _do_summarize(conn)
                 elif action == "ask":             _do_ask(conn)

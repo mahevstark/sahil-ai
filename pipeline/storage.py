@@ -161,15 +161,20 @@ def load_transcription_chunks(conn, video_id: str, model_size: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def queue_videos(conn, video_ids: list) -> int:
-    """Insert video IDs into job_queue. Skips already-queued/processed. Returns count added."""
-    count = 0
+    """Insert video IDs into job_queue in one statement. Returns count newly added."""
+    if not video_ids:
+        return 0
     with conn.cursor() as cur:
-        for vid in video_ids:
-            cur.execute("""
-                INSERT INTO job_queue (video_id) VALUES (%s)
+        cur.execute("""
+            WITH inserted AS (
+                INSERT INTO job_queue (video_id)
+                SELECT unnest(%s::text[])
                 ON CONFLICT (video_id) DO NOTHING
-            """, (vid,))
-            count += cur.rowcount
+                RETURNING video_id
+            )
+            SELECT COUNT(*) FROM inserted
+        """, (list(video_ids),))
+        count = cur.fetchone()[0]
     conn.commit()
     return count
 

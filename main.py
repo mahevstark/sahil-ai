@@ -60,7 +60,8 @@ def _do_queue(conn):
         path = questionary.text("Path to file:").ask()
         if not path:
             return
-        ids = Path(path.strip()).read_text(encoding="utf-8").split()
+        ids = [i for i in Path(path.strip()).read_text(encoding="utf-8").split() if i]
+        print(f"  Read {len(ids)} video IDs from file.", flush=True)
 
     else:
         channel = questionary.text("Channel URL:").ask()
@@ -71,9 +72,14 @@ def _do_queue(conn):
         ids = [v["video_id"] for v in videos]
         print(f"  Found {len(ids)} videos.", flush=True)
 
+    if not ids:
+        print("  No video IDs found.")
+        return
+
+    print(f"  Queueing {len(ids)} video(s) ...", flush=True)
     added = queue_videos(conn, ids)
     skip  = len(ids) - added
-    print(f"\n  Queued {added} video(s)."
+    print(f"  Done. Queued {added} new video(s)."
           + (f"  ({skip} already in queue)" if skip else ""))
 
 

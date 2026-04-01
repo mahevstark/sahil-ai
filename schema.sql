@@ -23,9 +23,14 @@ CREATE TABLE IF NOT EXISTS chunks (
     UNIQUE (video_id, chunk_index)
 );
 
-CREATE INDEX IF NOT EXISTS chunks_embedding_idx
-    ON chunks USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+-- Note: ivfflat index is NOT created here on purpose.
+-- ivfflat requires at least `lists` rows to build correctly.
+-- Schema runs on every startup against an initially-empty table,
+-- which would produce an index with 0 cluster centers → zero search results.
+-- pgvector's sequential scan (<=> operator) is exact and fast up to ~100k rows.
+-- To add an approximate index later, run manually after data is loaded:
+--   CREATE INDEX chunks_embedding_idx ON chunks
+--     USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);
 
 -- Tracks per-video transcription jobs (one row per video+model combination)
 CREATE TABLE IF NOT EXISTS transcription_jobs (
@@ -59,7 +64,30 @@ CREATE TABLE IF NOT EXISTS worker_nodes (
     hostname       TEXT NOT NULL,
     status         TEXT DEFAULT 'idle', -- idle | busy | offline
     last_heartbeat TIMESTAMP DEFAULT NOW(),
-    registered_at  TIMESTAMP DEFAULT NOW()
+    registered_at  TIMESTAMP DEFAULT NOW(),
+    os             TEXT,
+    cpu            TEXT,
+    ram_gb         FLOAT,
+    whisper_model  TEXT
+);
+-- Add device columns to existing deployments
+ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS os            TEXT;
+ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS cpu           TEXT;
+ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS ram_gb        FLOAT;
+ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS whisper_model TEXT;
+
+-- Per-job transcription speed benchmarks
+CREATE TABLE IF NOT EXISTS worker_benchmarks (
+    id                  SERIAL PRIMARY KEY,
+    worker_id           TEXT REFERENCES worker_nodes(worker_id),
+    job_id              INT  REFERENCES job_queue(id),
+    video_id            TEXT NOT NULL,
+    model_size          TEXT,
+    audio_duration_secs FLOAT,
+    transcribe_secs     FLOAT,
+    word_count          INT,
+    words_per_minute    FLOAT,
+    created_at          TIMESTAMP DEFAULT NOW()
 );
 
 -- Distributed job queue (admin queues, workers claim)

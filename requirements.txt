@@ -6,3 +6,4 @@ pgvector
 click
 python-dotenv
 questionary
+psutil

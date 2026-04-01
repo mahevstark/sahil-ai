@@ -1,14 +1,17 @@
 """
 worker.py — distributed transcription worker.
 
-Launch via run_worker.bat (double-click) or:
+Launch via run_worker.bat (double-click) or run_worker.sh (Mac/Linux), or:
     python worker.py
 """
 
 import os
+import platform
 import socket
 import threading
 import time
+
+import psutil
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -132,10 +135,17 @@ def _heartbeat_loop(conn):
 # Main
 # ---------------------------------------------------------------------------
 
+def _collect_device_info(model_size: str) -> dict:
+    cpu = platform.processor() or platform.machine()
+    ram_gb = round(psutil.virtual_memory().total / (1024 ** 3), 1)
+    os_name = f"{platform.system()} {platform.release()}"
+    return {"os": os_name, "cpu": cpu, "ram_gb": ram_gb, "whisper_model": model_size}
+
+
 def main():
     from pipeline.fetcher import fetch_video_meta
     from pipeline.processor import process_video
-    from pipeline.storage import get_connection
+    from pipeline.storage import get_connection, record_benchmark, update_worker_device_info
     from pipeline.transcriber import load_model
 
     # Sanity-check env
@@ -156,6 +166,10 @@ def main():
 
     conn = get_connection()
     register_worker(conn)
+
+    device = _collect_device_info(model_size)
+    update_worker_device_info(conn, WORKER_ID, **device)
+    print(f"[worker] Device    : {device['os']} | {device['cpu']} | {device['ram_gb']} GB RAM", flush=True)
     print(f"[worker] Registered in DB.", flush=True)
 
     # Background heartbeat
@@ -184,10 +198,17 @@ def main():
             print(f"[worker] Title: {meta.get('title') or video_id}", flush=True)
 
             try:
-                process_video(conn, model, model_size, meta,
-                              log=lambda m: print(m, flush=True))
+                stats = process_video(conn, model, model_size, meta,
+                                      log=lambda m: print(m, flush=True))
                 complete_job(conn, job_id)
-                print(f"[worker] Job {job_id} complete.\n", flush=True)
+                record_benchmark(conn, WORKER_ID, job_id, video_id, model_size,
+                                 stats["audio_duration_secs"],
+                                 stats["transcribe_secs"],
+                                 stats["word_count"])
+                print(f"[worker] Job {job_id} complete — "
+                      f"{stats['word_count']} words in {stats['transcribe_secs']}s "
+                      f"({round(stats['word_count'] / stats['transcribe_secs'] * 60) if stats['transcribe_secs'] else 0} WPM).\n",
+                      flush=True)
             except Exception as exc:
                 print(f"[worker] Job {job_id} failed: {exc}", flush=True)
                 fail_job(conn, job_id, str(exc))

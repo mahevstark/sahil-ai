@@ -1,6 +1,8 @@
 """
 pipeline/processor.py — core video processing shared by main.py and worker.py.
 """
+import time
+
 from pipeline.embedder import embed_texts
 from pipeline.fetcher import download_audio as _fetch_audio
 from pipeline.storage import (
@@ -16,8 +18,11 @@ from pipeline.storage import (
 from pipeline.transcriber import WORK_DIR, chunk_segments, split_audio, transcribe
 
 
-def process_video(conn, model, model_size: str, meta: dict, log=print):
-    """Download → chunk → transcribe (with per-chunk DB resume) → embed → store."""
+def process_video(conn, model, model_size: str, meta: dict, log=print) -> dict:
+    """Download → chunk → transcribe (with per-chunk DB resume) → embed → store.
+
+    Returns a stats dict: {word_count, transcribe_secs, audio_duration_secs}.
+    """
     video_id = meta["video_id"]
     title    = meta.get("title") or video_id
 
@@ -43,12 +48,15 @@ def process_video(conn, model, model_size: str, meta: dict, log=print):
     if done:
         log(f"  Resuming: {len(done)}/{total} chunks already done.")
 
+    transcribe_secs = 0.0
     for i, (chunk_path, offset) in enumerate(chunks):
         if i in done:
             log(f"  Chunk {i+1}/{total} already done, skipping.")
             continue
         log(f"  Transcribing chunk {i+1}/{total} (offset {offset:.0f}s) ...")
+        t0   = time.monotonic()
         segs = transcribe(model, chunk_path)
+        transcribe_secs += time.monotonic() - t0
         for s in segs:
             s["start"] += offset
             s["end"]   += offset
@@ -71,4 +79,12 @@ def process_video(conn, model, model_size: str, meta: dict, log=print):
     upsert_chunks(conn, video_id, sem_chunks)
     mark_processed(conn, video_id)
     mark_transcription_job_done(conn, video_id, model_size)
-    log(f"  Done — {len(sem_chunks)} chunks embedded.")
+
+    word_count = sum(len(t.split()) for t in texts)
+    log(f"  Done — {len(sem_chunks)} chunks embedded, {word_count} words.")
+
+    return {
+        "word_count":          word_count,
+        "transcribe_secs":     round(transcribe_secs, 2),
+        "audio_duration_secs": meta.get("duration") or 0.0,
+    }

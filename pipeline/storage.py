@@ -17,8 +17,15 @@ def get_connection():
         cur.execute(schema_sql)
     bootstrap.commit()
     bootstrap.close()
-    # Fresh connection with pgvector registered
-    conn = psycopg2.connect(database_url)
+    # Fresh connection with pgvector registered + TCP keepalives so Railway
+    # doesn't kill idle connections during long audio-download/split phases.
+    conn = psycopg2.connect(
+        database_url,
+        keepalives=1,
+        keepalives_idle=60,       # send first keepalive after 60s idle
+        keepalives_interval=10,   # retry every 10s
+        keepalives_count=5,       # give up after 5 missed responses
+    )
     register_vector(conn)
     return conn
 
@@ -190,8 +197,56 @@ def get_queue_stats(conn) -> dict:
 def get_worker_nodes(conn) -> list:
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT worker_id, hostname, status, last_heartbeat
+            SELECT worker_id, hostname, status, last_heartbeat, os, cpu, ram_gb, whisper_model
             FROM worker_nodes ORDER BY last_heartbeat DESC
+        """)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def update_worker_device_info(conn, worker_id: str, os: str, cpu: str,
+                               ram_gb: float, whisper_model: str):
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE worker_nodes
+            SET os = %s, cpu = %s, ram_gb = %s, whisper_model = %s
+            WHERE worker_id = %s
+        """, (os, cpu, ram_gb, whisper_model, worker_id))
+    conn.commit()
+
+
+def record_benchmark(conn, worker_id: str, job_id: int, video_id: str,
+                     model_size: str, audio_duration_secs: float,
+                     transcribe_secs: float, word_count: int):
+    wpm = (word_count / transcribe_secs * 60) if transcribe_secs > 0 else 0.0
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO worker_benchmarks
+                (worker_id, job_id, video_id, model_size,
+                 audio_duration_secs, transcribe_secs, word_count, words_per_minute)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (worker_id, job_id, video_id, model_size,
+              audio_duration_secs, transcribe_secs, word_count, round(wpm, 1)))
+    conn.commit()
+
+
+def get_benchmarks(conn) -> list:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                b.worker_id,
+                n.os,
+                n.cpu,
+                n.ram_gb,
+                b.model_size,
+                COUNT(*)                        AS jobs,
+                ROUND(AVG(b.words_per_minute))  AS avg_wpm,
+                ROUND(MAX(b.words_per_minute))  AS best_wpm,
+                ROUND(AVG(b.audio_duration_secs) / 60, 1) AS avg_audio_mins
+            FROM worker_benchmarks b
+            JOIN worker_nodes n ON n.worker_id = b.worker_id
+            GROUP BY b.worker_id, n.os, n.cpu, n.ram_gb, b.model_size
+            ORDER BY avg_wpm DESC
         """)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]

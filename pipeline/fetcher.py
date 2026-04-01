@@ -1,5 +1,6 @@
 import datetime
 import shutil
+import sys
 from pathlib import Path
 
 import yt_dlp
@@ -9,12 +10,14 @@ def _find_ytdlp() -> str:
     exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
     if exe:
         return exe
-    for pkg in (Path.home() / "AppData" / "Local" / "Packages").glob(
-        "PythonSoftwareFoundation.Python.*"
-    ):
-        p = pkg / "LocalCache" / "local-packages" / "Python313" / "Scripts" / "yt-dlp.exe"
-        if p.exists():
-            return str(p)
+    # Windows-only fallback: Microsoft Store Python puts scripts in AppData
+    if sys.platform == "win32":
+        for pkg in (Path.home() / "AppData" / "Local" / "Packages").glob(
+            "PythonSoftwareFoundation.Python.*"
+        ):
+            p = pkg / "LocalCache" / "local-packages" / "Python313" / "Scripts" / "yt-dlp.exe"
+            if p.exists():
+                return str(p)
     raise FileNotFoundError("yt-dlp not found — run: pip install yt-dlp")
 
 

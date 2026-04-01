@@ -9,3 +9,4 @@ __pycache__/
 *.m4a
 .claude/
 test_out.txt
+venv

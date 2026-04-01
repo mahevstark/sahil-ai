@@ -37,7 +37,16 @@ def register_worker(conn):
                 status         = 'idle',
                 last_heartbeat = NOW()
         """, (WORKER_ID, socket.gethostname()))
+        # Release any jobs this worker owned from a previous crashed session
+        cur.execute("""
+            UPDATE job_queue
+            SET status = 'queued', worker_id = NULL, started_at = NULL
+            WHERE worker_id = %s AND status = 'processing'
+        """, (WORKER_ID,))
+        released = cur.rowcount
     conn.commit()
+    if released:
+        print(f"[worker] Released {released} stale job(s) from previous session.", flush=True)
 
 
 def set_status(conn, status: str):

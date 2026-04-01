@@ -1,7 +1,24 @@
 import datetime
+import shutil
 from pathlib import Path
 
 import yt_dlp
+
+
+def _find_ytdlp() -> str:
+    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    if exe:
+        return exe
+    for pkg in (Path.home() / "AppData" / "Local" / "Packages").glob(
+        "PythonSoftwareFoundation.Python.*"
+    ):
+        p = pkg / "LocalCache" / "local-packages" / "Python313" / "Scripts" / "yt-dlp.exe"
+        if p.exists():
+            return str(p)
+    raise FileNotFoundError("yt-dlp not found — run: pip install yt-dlp")
+
+
+_YTDLP = _find_ytdlp()
 
 
 def list_channel_videos(channel_url: str) -> list:
@@ -43,17 +60,14 @@ def list_channel_videos(channel_url: str) -> list:
 
 def fetch_video_meta(video_id: str) -> dict:
     """Fetch title/channel/duration/date for a single video via yt-dlp."""
-    import datetime
     import json
-    import shutil
     import subprocess
 
-    ytdlp   = shutil.which("yt-dlp") or "yt-dlp"
-    url     = f"https://www.youtube.com/watch?v={video_id}"
+    url = f"https://www.youtube.com/watch?v={video_id}"
     fallback = {"video_id": video_id, "title": video_id, "channel": None,
                 "url": url, "duration": None, "uploaded_at": None}
     r = subprocess.run(
-        [ytdlp, "--dump-json", "--no-playlist", url],
+        [_YTDLP, "--dump-json", "--no-playlist", url],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if r.returncode != 0:

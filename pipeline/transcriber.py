@@ -1,6 +1,8 @@
 import re
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from faster_whisper import WhisperModel
@@ -36,12 +38,32 @@ def load_model(model_size: str = "large-v3") -> WhisperModel:
     compute_type = "int8_float16" if device == "cuda" else "int8"
     MODEL_CACHE.mkdir(parents=True, exist_ok=True)
     cached = MODEL_CACHE / model_size
+
     if cached.exists():
         print(f"  Loading Whisper {model_size} from local cache ...", flush=True)
     else:
-        print(f"  Downloading Whisper {model_size} (one-time) ...", flush=True)
-    return WhisperModel(model_size, device=device, compute_type=compute_type,
-                        download_root=str(MODEL_CACHE))
+        print(f"  Downloading Whisper {model_size} (~3 GB, one-time) ...", flush=True)
+
+    done = threading.Event()
+
+    def _progress():
+        symbols = ["|", "/", "-", "\\"]
+        i = 0
+        while not done.is_set():
+            print(f"\r  Please wait ... {symbols[i % 4]}", end="", flush=True)
+            i += 1
+            time.sleep(0.5)
+        print("\r  Model ready.                    ", flush=True)
+
+    t = threading.Thread(target=_progress, daemon=True)
+    t.start()
+    try:
+        model = WhisperModel(model_size, device=device, compute_type=compute_type,
+                             download_root=str(MODEL_CACHE))
+    finally:
+        done.set()
+        t.join()
+    return model
 
 
 def get_audio_duration(wav_path: Path) -> float:

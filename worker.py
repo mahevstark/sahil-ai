@@ -128,16 +128,48 @@ def fail_job(conn, job_id: int, error: str):
 
 
 # ---------------------------------------------------------------------------
+# Connection helpers
+# ---------------------------------------------------------------------------
+
+def _new_conn():
+    from pipeline.storage import get_connection
+    return get_connection()
+
+
+def _ensure_conn(conn):
+    """Return conn if alive, otherwise reconnect and re-register."""
+    try:
+        conn.cursor().execute("SELECT 1")
+        return conn
+    except Exception:
+        print("[worker] DB connection lost — reconnecting ...", flush=True)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        new = _new_conn()
+        register_worker(new)
+        print("[worker] Reconnected.", flush=True)
+        return new
+
+
+# ---------------------------------------------------------------------------
 # Heartbeat thread
 # ---------------------------------------------------------------------------
 
-def _heartbeat_loop(conn):
+_conn_holder = {}   # mutable dict so the heartbeat thread always uses latest conn
+
+
+def _heartbeat_loop():
     while True:
         time.sleep(HEARTBEAT_INTERVAL)
+        conn = _conn_holder.get("conn")
+        if conn is None:
+            continue
         try:
             ping_heartbeat(conn)
         except Exception:
-            pass  # Don't crash the thread — main loop will detect DB issues
+            pass  # main loop will reconnect
 
 
 # ---------------------------------------------------------------------------
@@ -175,14 +207,15 @@ def main():
 
     conn = get_connection()
     register_worker(conn)
+    _conn_holder["conn"] = conn
 
     device = _collect_device_info(model_size)
     update_worker_device_info(conn, WORKER_ID, **device)
     print(f"[worker] Device    : {device['os']} | {device['cpu']} | {device['ram_gb']} GB RAM", flush=True)
     print(f"[worker] Registered in DB.", flush=True)
 
-    # Background heartbeat
-    threading.Thread(target=_heartbeat_loop, args=(conn,), daemon=True).start()
+    # Background heartbeat (uses _conn_holder so it follows reconnects)
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
     print(f"[worker] Loading Whisper model ...", flush=True)
     model = load_model(model_size)
@@ -191,6 +224,9 @@ def main():
 
     try:
         while True:
+            conn = _ensure_conn(conn)
+            _conn_holder["conn"] = conn
+
             requeue_stale(conn)
             job = claim_job(conn)
 
@@ -206,27 +242,41 @@ def main():
             meta = fetch_video_meta(video_id)
             print(f"[worker] Title: {meta.get('title') or video_id}", flush=True)
 
+            # Fresh connection per job — long jobs (hours) would kill a shared conn
+            proc_conn = _new_conn()
             try:
-                stats = process_video(conn, model, model_size, meta,
+                stats = process_video(proc_conn, model, model_size, meta,
                                       log=lambda *a, **kw: print(*a, flush=True, **kw))
+                conn = _ensure_conn(conn)
+                _conn_holder["conn"] = conn
                 complete_job(conn, job_id)
                 record_benchmark(conn, WORKER_ID, job_id, video_id, model_size,
                                  stats["audio_duration_secs"],
                                  stats["transcribe_secs"],
                                  stats["word_count"])
+                wpm = round(stats["word_count"] / stats["transcribe_secs"] * 60) if stats["transcribe_secs"] else 0
                 print(f"[worker] Job {job_id} complete — "
                       f"{stats['word_count']} words in {stats['transcribe_secs']}s "
-                      f"({round(stats['word_count'] / stats['transcribe_secs'] * 60) if stats['transcribe_secs'] else 0} WPM).\n",
-                      flush=True)
+                      f"({wpm} WPM).\n", flush=True)
             except Exception as exc:
                 print(f"[worker] Job {job_id} failed: {exc}", flush=True)
+                conn = _ensure_conn(conn)
+                _conn_holder["conn"] = conn
                 fail_job(conn, job_id, str(exc))
+            finally:
+                try:
+                    proc_conn.close()
+                except Exception:
+                    pass
 
     except KeyboardInterrupt:
         print("\n[worker] Shutting down ...", flush=True)
     finally:
-        set_status(conn, "offline")
-        conn.close()
+        try:
+            set_status(conn, "offline")
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

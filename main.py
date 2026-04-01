@@ -240,38 +240,21 @@ def _do_ask(conn):
             print(f"             \"{snippet}\"")
 
 
-# ── Process now (direct, bypass queue) ────────────────────────────────────
+# ── Process now (claims from queue) ───────────────────────────────────────
 
 def _do_run(conn):
     import questionary
-    from pipeline.fetcher import fetch_video_meta, list_channel_videos
+    from pipeline.fetcher import fetch_video_meta
     from pipeline.processor import process_video
-    from pipeline.storage import video_exists
+    from pipeline.storage import get_queue_stats
     from pipeline.transcriber import load_model
 
-    source = questionary.select(
-        "Process from:",
-        choices=[
-            questionary.Choice("Enter video IDs", value="ids"),
-            questionary.Choice("YouTube channel URL", value="channel"),
-        ],
-    ).ask()
-    if not source:
+    stats  = get_queue_stats(conn)
+    queued = stats.get("queued", 0)
+    if queued == 0:
+        print("  Queue is empty. Use 'Queue videos' first.")
         return
-
-    if source == "ids":
-        raw = questionary.text("Video IDs (comma-separated):").ask()
-        if not raw:
-            return
-        ids = [v.strip() for v in raw.split(",") if v.strip()]
-        videos = [fetch_video_meta(vid) for vid in ids]
-    else:
-        channel = questionary.text("Channel URL:").ask()
-        if not channel:
-            return
-        print("  Fetching video list ...", flush=True)
-        videos = list_channel_videos(channel.strip())
-        print(f"  Found {len(videos)} videos.", flush=True)
+    print(f"  {queued} video(s) waiting in queue.", flush=True)
 
     model_size = questionary.select(
         "Whisper model:",
@@ -288,22 +271,51 @@ def _do_run(conn):
 
     print(f"\n  Loading Whisper '{model_size}' ...", flush=True)
     model = load_model(model_size)
+    print(f"  Processing queue — press Ctrl-C to stop.\n", flush=True)
 
-    for meta in videos:
-        vid   = meta["video_id"]
-        title = meta.get("title") or vid
-        if video_exists(conn, vid):
-            with conn.cursor() as cur:
-                cur.execute("SELECT processed FROM videos WHERE video_id = %s", (vid,))
-                row = cur.fetchone()
-                if row and row[0]:
-                    print(f"  Skipping (already processed): {title}")
-                    continue
+    done = 0
+    while True:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE job_queue
+                SET status = 'processing', worker_id = 'local', started_at = NOW()
+                WHERE id = (
+                    SELECT id FROM job_queue WHERE status = 'queued'
+                    ORDER BY queued_at LIMIT 1 FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, video_id
+            """)
+            row = cur.fetchone()
+        conn.commit()
+
+        if row is None:
+            print(f"\n  Queue empty. Processed {done} video(s) this session.")
+            break
+
+        job_id, video_id = row
+        meta = fetch_video_meta(video_id)
+        print(f"  [{done+1}/{done + queued}] {meta.get('title') or video_id}", flush=True)
+
         try:
-            print(f"\n  Processing: {title}", flush=True)
             process_video(conn, model, model_size, meta)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE job_queue SET status='completed', completed_at=NOW() WHERE id=%s",
+                    (job_id,)
+                )
+            conn.commit()
+            done += 1
         except Exception as exc:
-            print(f"  Error: {exc}", err=True)
+            print(f"       Error: {exc}", flush=True)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE job_queue SET
+                        retries = retries + 1, error_msg = %s,
+                        worker_id = NULL, started_at = NULL,
+                        status = CASE WHEN retries + 1 >= 3 THEN 'failed' ELSE 'queued' END
+                    WHERE id = %s
+                """, (str(exc)[:500], job_id))
+            conn.commit()
 
 
 # ── Main interactive loop ──────────────────────────────────────────────────

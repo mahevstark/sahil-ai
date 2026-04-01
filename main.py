@@ -359,8 +359,10 @@ def _interactive_mode():
                 elif action == "ask":             _do_ask(conn)
                 elif action == "clear_queue":     _do_clear_queue(conn)
             except KeyboardInterrupt:
+                conn.rollback()
                 print("  (cancelled)")
             except Exception as exc:
+                conn.rollback()
                 print(f"\n  Error: {exc}")
             print()
 

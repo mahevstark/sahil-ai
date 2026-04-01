@@ -83,6 +83,40 @@ def _do_queue(conn):
           + (f"  ({skip} already in queue)" if skip else ""))
 
 
+# ── Clear queue ────────────────────────────────────────────────────────────
+
+def _do_clear_queue(conn):
+    import questionary
+
+    scope = questionary.select(
+        "Which jobs to remove?",
+        choices=[
+            questionary.Choice("Queued only  (waiting, not yet started)", value="queued"),
+            questionary.Choice("Failed only  (exhausted retries)",         value="failed"),
+            questionary.Choice("All          (queued + failed + processing)", value="all"),
+        ],
+    ).ask()
+    if not scope:
+        return
+
+    confirm = questionary.confirm(
+        f"Delete all '{scope}' jobs from the queue? This cannot be undone.",
+        default=False,
+    ).ask()
+    if not confirm:
+        print("  Cancelled.")
+        return
+
+    with conn.cursor() as cur:
+        if scope == "all":
+            cur.execute("DELETE FROM job_queue")
+        else:
+            cur.execute("DELETE FROM job_queue WHERE status = %s", (scope,))
+        deleted = cur.rowcount
+    conn.commit()
+    print(f"  Removed {deleted} job(s) from the queue.")
+
+
 # ── Status ─────────────────────────────────────────────────────────────────
 
 def _do_status(conn):
@@ -292,6 +326,7 @@ def _interactive_mode():
         questionary.Choice("Search videos by text",                  value="search"),
         questionary.Choice("Summarize a video",                      value="summarize"),
         questionary.Choice("Ask a question (answers from videos)",   value="ask"),
+        questionary.Choice("Clear queue",                            value="clear_queue"),
         questionary.Choice("Exit",                                   value="exit"),
     ]
 
@@ -304,12 +339,13 @@ def _interactive_mode():
 
             print()
             try:
-                if action == "queue":       _do_queue(conn)
-                elif action == "run":       _do_run(conn)
-                elif action == "status":    _do_status(conn)
-                elif action == "search":    _do_search(conn)
-                elif action == "summarize": _do_summarize(conn)
-                elif action == "ask":       _do_ask(conn)
+                if action == "queue":             _do_queue(conn)
+                elif action == "run":             _do_run(conn)
+                elif action == "status":          _do_status(conn)
+                elif action == "search":          _do_search(conn)
+                elif action == "summarize":       _do_summarize(conn)
+                elif action == "ask":             _do_ask(conn)
+                elif action == "clear_queue":     _do_clear_queue(conn)
             except KeyboardInterrupt:
                 print("  (cancelled)")
             except Exception as exc:

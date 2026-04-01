@@ -199,7 +199,7 @@ def main():
 
             try:
                 stats = process_video(conn, model, model_size, meta,
-                                      log=lambda m: print(m, flush=True))
+                                      log=lambda *a, **kw: print(*a, flush=True, **kw))
                 complete_job(conn, job_id)
                 record_benchmark(conn, WORKER_ID, job_id, video_id, model_size,
                                  stats["audio_duration_secs"],

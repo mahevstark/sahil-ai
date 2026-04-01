@@ -35,8 +35,7 @@ def process_video(conn, model, model_size: str, meta: dict, log=print) -> dict:
     if wav.exists():
         log("  Audio cached, skipping download.")
     else:
-        log("  Downloading audio ...")
-        tmp = _fetch_audio(video_id, video_dir)
+        tmp = _fetch_audio(video_id, video_dir, log=log)
         if tmp != wav:
             tmp.rename(wav)
 
@@ -72,7 +71,7 @@ def process_video(conn, model, model_size: str, meta: dict, log=print) -> dict:
     sem_chunks = chunk_segments(all_segs)
     texts      = [c["text"] for c in sem_chunks]
     log(f"  Embedding {len(texts)} semantic chunks ...")
-    embeddings = embed_texts(texts)
+    embeddings = embed_texts(texts, log=log)
     for c, emb in zip(sem_chunks, embeddings):
         c["embedding"] = emb
 

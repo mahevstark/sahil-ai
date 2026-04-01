@@ -90,15 +90,34 @@ def fetch_video_meta(video_id: str) -> dict:
         return fallback
 
 
-def download_audio(video_id: str, output_dir: Path) -> Path:
+def download_audio(video_id: str, output_dir: Path, log=print) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(output_dir / f"{video_id}.%(ext)s")
+
+    def _progress_hook(d):
+        if d["status"] == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            downloaded = d.get("downloaded_bytes", 0)
+            speed = d.get("speed") or 0
+            if total:
+                pct = downloaded / total * 100
+                mb = downloaded / (1024 * 1024)
+                total_mb = total / (1024 * 1024)
+                mbps = speed / (1024 * 1024)
+                log(f"\r  Downloading audio ... {pct:.0f}% ({mb:.1f}/{total_mb:.1f} MB) {mbps:.1f} MB/s",
+                    end="")
+            else:
+                mb = downloaded / (1024 * 1024)
+                log(f"\r  Downloading audio ... {mb:.1f} MB", end="")
+        elif d["status"] == "finished":
+            log(f"\r  Download complete. Converting to WAV ...        ")
 
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": output_template,
         "quiet": True,
         "no_warnings": True,
+        "progress_hooks": [_progress_hook],
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",

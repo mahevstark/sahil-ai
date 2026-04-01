@@ -278,7 +278,7 @@ def _do_run(conn):
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE job_queue
-                SET status = 'processing', worker_id = 'local', started_at = NOW()
+                SET status = 'processing', worker_id = NULL, started_at = NOW()
                 WHERE id = (
                     SELECT id FROM job_queue WHERE status = 'queued'
                     ORDER BY queued_at LIMIT 1 FOR UPDATE SKIP LOCKED

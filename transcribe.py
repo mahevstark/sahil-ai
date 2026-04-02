@@ -80,7 +80,15 @@ def get_db_conn():
     bootstrap.commit()
     bootstrap.close()
     # Second connection: vector type now exists, safe to register
-    conn = psycopg2.connect(url)
+    # TCP keepalives prevent Railway from killing idle connections during
+    # long audio-download/split phases (can be 10-20 min with no DB activity).
+    conn = psycopg2.connect(
+        url,
+        keepalives=1,
+        keepalives_idle=60,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
     register_vector(conn)
     return conn
 

@@ -37,7 +37,7 @@ def _wrap(text: str, indent: int = 4) -> str:
 def _do_queue(conn):
     import questionary
     from pipeline.fetcher import list_channel_videos
-    from pipeline.storage import queue_videos
+    from pipeline.storage import get_processed_video_ids, get_queued_video_ids, queue_videos
 
     source = questionary.select(
         "Queue videos from:",
@@ -76,11 +76,31 @@ def _do_queue(conn):
         print("  No video IDs found.")
         return
 
-    print(f"  Queueing {len(ids)} video(s) ...", flush=True)
-    added = queue_videos(conn, ids)
-    skip  = len(ids) - added
-    print(f"  Done. Queued {added} new video(s)."
-          + (f"  ({skip} already in queue)" if skip else ""))
+    # Show breakdown before queueing
+    processed = get_processed_video_ids(conn, ids)
+    queued = get_queued_video_ids(conn, ids)
+    new_ids = [i for i in ids if i not in processed and i not in queued]
+
+    print(f"\n  Total found    : {len(ids)}")
+    print(f"  Already done   : {len(processed)}")
+    print(f"  Already queued : {len(queued) - len(queued & processed)}")
+    print(f"  New to queue   : {len(new_ids)}")
+
+    if not new_ids:
+        print("\n  Nothing new to queue.")
+        return
+
+    if len(new_ids) > 50:
+        confirm = questionary.confirm(
+            f"  Queue {len(new_ids)} videos?", default=True
+        ).ask()
+        if not confirm:
+            print("  Cancelled.")
+            return
+
+    print(f"  Queueing {len(new_ids)} video(s) ...", flush=True)
+    added = queue_videos(conn, new_ids)
+    print(f"  Done. Queued {added} new video(s).")
 
 
 # ── Clear queue ────────────────────────────────────────────────────────────
@@ -154,7 +174,9 @@ def _do_workers(conn):
 # ── Status ─────────────────────────────────────────────────────────────────
 
 def _do_status(conn):
-    from pipeline.storage import get_queue_stats, get_worker_nodes
+    from pipeline.storage import (get_active_jobs, get_avg_processing_time,
+                                   get_channel_progress, get_queue_stats,
+                                   get_worker_nodes)
 
     stats   = get_queue_stats(conn)
     workers = get_worker_nodes(conn)
@@ -167,12 +189,47 @@ def _do_status(conn):
         print(f"    {status:12s}: {count:4d}  {bar}")
     print(f"    {'total':12s}: {sum(stats.values()):4d}")
 
+    # ETA calculation
+    queued = stats.get("queued", 0)
+    if queued > 0:
+        avg_time = get_avg_processing_time(conn)
+        active_workers = sum(1 for w in workers if w["status"] == "busy")
+        if avg_time > 0 and active_workers > 0:
+            eta_secs = (queued * avg_time) / active_workers
+            eta_hrs = eta_secs / 3600
+            if eta_hrs >= 1:
+                print(f"    ETA          : ~{eta_hrs:.1f} hours ({active_workers} active workers)")
+            else:
+                print(f"    ETA          : ~{eta_secs / 60:.0f} minutes ({active_workers} active workers)")
+
+    # Active jobs
+    active = get_active_jobs(conn)
+    if active:
+        print("\n  -- Currently Processing --")
+        for j in active:
+            elapsed = int(j["elapsed_secs"] or 0)
+            mins, secs = divmod(elapsed, 60)
+            print(f"    {j['worker_id'] or '?':<25} {j['title'] or j['video_id']}"
+                  f"  ({mins}m {secs}s)")
+
     print("\n  -- Workers --")
     if not workers:
         print("    No workers registered yet.")
     for w in workers:
         print(f"    {w['hostname']:25s}  {w['status']:8s}  "
               f"last seen: {str(w['last_heartbeat'])[:19]}")
+
+    # Channel progress
+    channels = get_channel_progress(conn)
+    if channels:
+        print("\n  -- Channel Progress --")
+        for ch in channels:
+            total = int(ch["total"])
+            done = int(ch["done"])
+            pct = (done / total * 100) if total else 0
+            bar = "#" * int(pct / 2.5) + "." * (40 - int(pct / 2.5))
+            name = (ch["channel"] or "Unknown")[:35]
+            print(f"    {name:<36} {done:>4}/{total:<4}  [{bar}] {pct:.0f}%")
 
     print("\n  -- Recently Processed --")
     with conn.cursor() as cur:
@@ -188,6 +245,24 @@ def _do_status(conn):
         print("    None yet.")
     for title, vid, model, ts in recent:
         print(f"    {str(ts)[:19]}  [{model}]  {title or vid}")
+
+
+# ── Live Dashboard ────────────────────────────────────────────────────────
+
+def _do_dashboard(conn):
+    """Auto-refreshing status dashboard. Press Ctrl-C to exit."""
+    print("  Live dashboard — refreshing every 5s. Press Ctrl-C to stop.\n")
+    try:
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("=" * 52)
+            print("   Sahil AI  —  Live Dashboard")
+            print("=" * 52)
+            _do_status(conn)
+            print("\n  [Refreshing in 5s — Ctrl-C to stop]")
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\n  Dashboard stopped.")
 
 
 # ── Search ─────────────────────────────────────────────────────────────────
@@ -245,33 +320,42 @@ def _do_summarize(conn):
     print(_wrap(summary, indent=4))
 
 
-# ── Ask ────────────────────────────────────────────────────────────────────
+# ── Ask (Interactive Q&A Loop) ────────────────────────────────────────────
 
 def _do_ask(conn):
     import questionary
     from pipeline.qa import answer_question
 
-    question = questionary.text("Your question:").ask()
-    if not question:
-        return
-    raw_k = questionary.text("Max sources to use:", default="5").ask()
-    top_k = int(raw_k) if raw_k and raw_k.isdigit() else 5
+    raw_k = questionary.text("Max sources to use:", default="10").ask()
+    top_k = int(raw_k) if raw_k and raw_k.isdigit() else 10
 
-    print(f"\n  Thinking ...\n", flush=True)
-    result = answer_question(conn, question, top_k=top_k)
+    print("\n  Interactive Q&A — ask follow-up questions. Empty input to exit.\n")
 
-    print("  Answer:\n")
-    print(_wrap(result["answer"], indent=4))
+    history = []
+    while True:
+        question = questionary.text("Your question:").ask()
+        if not question:
+            break
 
-    if result["sources"]:
-        print(f"\n  Sources used ({len(result['sources'])}):\n")
-        for s in result["sources"]:
-            snippet = (s["text"] or "")[:150].replace("\n", " ")
-            print(f"  [Source {s['index']}] {s['title'] or s['video_id']}")
-            print(f"             similarity : {s['similarity']:.4f}")
-            print(f"             timestamp  : {s['start_sec']:.1f}s - {s['end_sec']:.1f}s")
-            print(f"             url        : {s['url']}")
-            print(f"             \"{snippet}\"")
+        print(f"\n  Thinking ...\n", flush=True)
+        result = answer_question(conn, question, top_k=top_k, history=history)
+
+        print("  Answer:\n")
+        print(_wrap(result["answer"], indent=4))
+
+        if result["sources"]:
+            print(f"\n  Sources used ({len(result['sources'])}):\n")
+            for s in result["sources"]:
+                snippet = (s["text"] or "")[:150].replace("\n", " ")
+                print(f"  [Source {s['index']}] {s['title'] or s['video_id']}")
+                print(f"             similarity : {s['similarity']:.4f}")
+                print(f"             timestamp  : {s['start_sec']:.1f}s - {s['end_sec']:.1f}s")
+                print(f"             url        : {s['url']}")
+                print(f"             \"{snippet}\"")
+
+        # Save to history for conversation memory
+        history.append({"question": question, "answer": result["answer"]})
+        print()
 
 
 # ── Process now (claims from queue) ───────────────────────────────────────
@@ -386,13 +470,20 @@ def _interactive_mode():
     _print_header()
 
     print("  Connecting to database ...", flush=True)
-    conn = get_connection()
+    try:
+        conn = get_connection()
+    except Exception as exc:
+        print(f"  ERROR: Cannot connect to database: {exc}")
+        print(f"  Check DATABASE_URL in .env and ensure PostgreSQL is running.")
+        input("  Press Enter to exit...")
+        return
     print("  Connected.\n", flush=True)
 
     MENU = [
         questionary.Choice("Queue videos for processing",            value="queue"),
         questionary.Choice("Process videos now (on this machine)",   value="run"),
         questionary.Choice("Check progress & worker status",         value="status"),
+        questionary.Choice("Live dashboard (auto-refresh)",          value="dashboard"),
         questionary.Choice("Workers & performance benchmarks",        value="workers"),
         questionary.Choice("Search videos by text",                  value="search"),
         questionary.Choice("Summarize a video",                      value="summarize"),
@@ -413,6 +504,7 @@ def _interactive_mode():
                 if action == "queue":             _do_queue(conn)
                 elif action == "run":             _do_run(conn)
                 elif action == "status":          _do_status(conn)
+                elif action == "dashboard":       _do_dashboard(conn)
                 elif action == "workers":         _do_workers(conn)
                 elif action == "search":          _do_search(conn)
                 elif action == "summarize":       _do_summarize(conn)
@@ -451,25 +543,40 @@ def cli(ctx):
 @cli.command("queue")
 @click.option("--videos",  "videos_opt", default=None,
               help="Comma-separated video IDs or @file.txt")
-@click.option("--channel", default=None, help="YouTube channel URL")
+@click.option("--channel", multiple=True, help="YouTube channel URL(s)")
 def queue_cmd(videos_opt, channel):
     """Queue videos for distributed processing."""
     if not videos_opt and not channel:
         raise click.UsageError("Provide --videos or --channel")
     from pipeline.fetcher import list_channel_videos
-    from pipeline.storage import get_connection, queue_videos
+    from pipeline.storage import (get_connection, get_processed_video_ids,
+                                   get_queued_video_ids, queue_videos)
     conn = get_connection()
     try:
+        all_ids = []
         if videos_opt:
             ids = (Path(videos_opt[1:]).read_text(encoding="utf-8").split()
                    if videos_opt.startswith("@")
                    else [v.strip() for v in videos_opt.split(",") if v.strip()])
+            all_ids.extend(ids)
+
+        for ch_url in channel:
+            click.echo(f"Fetching {ch_url} ...")
+            videos = list_channel_videos(ch_url)
+            ch_ids = [v["video_id"] for v in videos]
+            processed = get_processed_video_ids(conn, ch_ids)
+            queued = get_queued_video_ids(conn, ch_ids)
+            new = [i for i in ch_ids if i not in processed and i not in queued]
+            ch_name = videos[0].get("channel", ch_url) if videos else ch_url
+            click.echo(f"  {ch_name}: {len(ch_ids)} found, {len(processed)} done, "
+                       f"{len(queued) - len(queued & processed)} queued, {len(new)} new")
+            all_ids.extend(new)
+
+        if all_ids:
+            added = queue_videos(conn, all_ids)
+            click.echo(f"Queued {added} / {len(all_ids)} video(s).")
         else:
-            click.echo(f"Fetching {channel} ...")
-            ids = [v["video_id"] for v in list_channel_videos(channel)]
-            click.echo(f"Found {len(ids)} videos.")
-        added = queue_videos(conn, ids)
-        click.echo(f"Queued {added} / {len(ids)} video(s).")
+            click.echo("Nothing new to queue.")
     finally:
         conn.close()
 
@@ -508,7 +615,7 @@ def search_cmd(query, top_k):
 
 @cli.command("ask")
 @click.argument("question")
-@click.option("--top-k", default=5, show_default=True, type=int)
+@click.option("--top-k", default=10, show_default=True, type=int)
 def ask_cmd(question, top_k):
     """Answer a question using video embeddings (RAG)."""
     from pipeline.qa import answer_question

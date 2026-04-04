@@ -1,0 +1,16 @@
+[Unit]
+Description=Sahil AI Transcription Worker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sahil-ai
+ExecStart=/usr/bin/python3 worker.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/opt/sahil-ai/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

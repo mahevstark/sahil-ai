@@ -60,8 +60,15 @@ def summarize_video(conn, video_id: str) -> tuple:
     }
 
 
-def answer_question(conn, question: str, top_k: int = 5) -> dict:
-    """RAG: embed question -> find chunks -> answer with GPT + source stamps."""
+def answer_question(conn, question: str, top_k: int = 10, history: list = None) -> dict:
+    """RAG: embed question -> find chunks -> answer with GPT + source stamps.
+
+    Args:
+        conn: Database connection.
+        question: The user's question.
+        top_k: Max chunks to retrieve.
+        history: Optional list of {"question": str, "answer": str} from prior turns.
+    """
     from pipeline.embedder import embed_texts
     from pipeline.storage import search_chunks
 
@@ -79,16 +86,28 @@ def answer_question(conn, question: str, top_k: int = 5) -> dict:
         for i, s in enumerate(sources, 1)
     )
 
+    messages = [
+        {"role": "system", "content": (
+            "You are a knowledgeable assistant. Answer the user's question using "
+            "ONLY the provided transcript sources. Cite sources inline as [Source N]. "
+            "When citing, include the YouTube timestamp link so the user can jump to "
+            "the exact moment. If the answer is not in the sources, say so clearly."
+        )},
+    ]
+
+    # Inject conversation history (last 5 exchanges max)
+    if history:
+        for h in history[-5:]:
+            messages.append({"role": "user", "content": h["question"]})
+            messages.append({"role": "assistant", "content": h["answer"]})
+
+    messages.append(
+        {"role": "user", "content": f"Sources:\n{context}\n\nQuestion: {question}"}
+    )
+
     resp = _client().chat.completions.create(
         model=_MODEL,
-        messages=[
-            {"role": "system", "content": (
-                "You are a knowledgeable assistant. Answer the user's question using "
-                "ONLY the provided transcript sources. Cite sources inline as [Source N]. "
-                "If the answer is not in the sources, say so clearly."
-            )},
-            {"role": "user", "content": f"Sources:\n{context}\n\nQuestion: {question}"},
-        ],
+        messages=messages,
         temperature=0.2,
         max_tokens=1500,
     )

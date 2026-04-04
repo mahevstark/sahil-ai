@@ -1,0 +1,14 @@
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+*.wav
+*.webm
+*.m4a
+venv/
+.venv/
+.claude/
+deploy/
+*.md
+LICENSE

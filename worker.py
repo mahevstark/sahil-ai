@@ -7,20 +7,30 @@ Launch via run_worker.bat (double-click) or run_worker.sh (Mac/Linux), or:
 
 import os
 import platform
+import signal
 import socket
+import sys
 import threading
 import time
+import traceback
 
 import psutil
 from dotenv import load_dotenv
 
 load_dotenv()
 
-WORKER_ID          = socket.gethostname()
+from pipeline.logger import get_logger
+
+log = get_logger("worker")
+
+WORKER_ID          = os.environ.get("WORKER_ID", socket.gethostname())
 HEARTBEAT_INTERVAL = 30    # seconds between DB heartbeat pings
 STALE_TIMEOUT      = 300   # seconds before a silent worker's jobs are re-queued
 POLL_INTERVAL      = 15    # seconds between job polls when idle
 MAX_RETRIES        = 3
+
+# Shutdown event — set by SIGTERM or Ctrl-C for graceful exit
+_shutdown = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +56,7 @@ def register_worker(conn):
         released = cur.rowcount
     conn.commit()
     if released:
-        print(f"[worker] Released {released} stale job(s) from previous session.", flush=True)
+        log.info("Released %d stale job(s) from previous session.", released)
 
 
 def set_status(conn, status: str):
@@ -81,7 +91,7 @@ def requeue_stale(conn):
         count = cur.rowcount
     conn.commit()
     if count:
-        print(f"[worker] Re-queued {count} stale job(s) from dead workers.", flush=True)
+        log.info("Re-queued %d stale job(s) from dead workers.", count)
 
 
 def claim_job(conn):
@@ -142,14 +152,14 @@ def _ensure_conn(conn):
         conn.cursor().execute("SELECT 1")
         return conn
     except Exception:
-        print("[worker] DB connection lost — reconnecting ...", flush=True)
+        log.warning("DB connection lost — reconnecting ...")
         try:
             conn.close()
         except Exception:
             pass
         new = _new_conn()
         register_worker(new)
-        print("[worker] Reconnected.", flush=True)
+        log.info("Reconnected.")
         return new
 
 
@@ -161,15 +171,17 @@ _conn_holder = {}   # mutable dict so the heartbeat thread always uses latest co
 
 
 def _heartbeat_loop():
-    while True:
-        time.sleep(HEARTBEAT_INTERVAL)
+    while not _shutdown.is_set():
+        _shutdown.wait(HEARTBEAT_INTERVAL)
+        if _shutdown.is_set():
+            break
         conn = _conn_holder.get("conn")
         if conn is None:
             continue
         try:
             ping_heartbeat(conn)
-        except Exception:
-            pass  # main loop will reconnect
+        except Exception as exc:
+            log.debug("Heartbeat failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -189,41 +201,52 @@ def main():
     from pipeline.storage import get_connection, record_benchmark, update_worker_device_info
     from pipeline.transcriber import load_model
 
+    # Handle SIGTERM (from systemd, Docker, etc.) for graceful shutdown
+    def _handle_signal(signum, frame):
+        log.info("Received signal %d — shutting down ...", signum)
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+
     # Sanity-check env
     if not os.environ.get("DATABASE_URL"):
-        print("ERROR: DATABASE_URL not set in .env — cannot connect to database.")
-        input("Press Enter to exit...")
-        return
+        log.error("DATABASE_URL not set in .env — cannot connect to database.")
+        sys.exit(1)
     if not os.environ.get("OPENAI_API_KEY"):
-        print("ERROR: OPENAI_API_KEY not set in .env — cannot generate embeddings.")
-        input("Press Enter to exit...")
-        return
+        log.error("OPENAI_API_KEY not set in .env — cannot generate embeddings.")
+        sys.exit(1)
 
     model_size = os.environ.get("WHISPER_MODEL", "large-v3")
 
-    print(f"[worker] Host      : {WORKER_ID}", flush=True)
-    print(f"[worker] Model     : {model_size}", flush=True)
-    print(f"[worker] Connecting to database ...", flush=True)
+    log.info("Worker ID  : %s", WORKER_ID)
+    log.info("Model      : %s", model_size)
+    log.info("Connecting to database ...")
 
-    conn = get_connection()
+    try:
+        conn = get_connection()
+    except Exception as exc:
+        log.error("Cannot connect to database: %s", exc)
+        log.error("Check DATABASE_URL and ensure PostgreSQL is running with pgvector installed.")
+        sys.exit(1)
+
     register_worker(conn)
     _conn_holder["conn"] = conn
 
     device = _collect_device_info(model_size)
     update_worker_device_info(conn, WORKER_ID, **device)
-    print(f"[worker] Device    : {device['os']} | {device['cpu']} | {device['ram_gb']} GB RAM", flush=True)
-    print(f"[worker] Registered in DB.", flush=True)
+    log.info("Device     : %s | %s | %s GB RAM", device['os'], device['cpu'], device['ram_gb'])
+    log.info("Registered in DB.")
 
     # Background heartbeat (uses _conn_holder so it follows reconnects)
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
-    print(f"[worker] Loading Whisper model ...", flush=True)
+    log.info("Loading Whisper model ...")
     model = load_model(model_size)
 
-    print(f"[worker] Ready — polling every {POLL_INTERVAL}s. Press Ctrl-C to stop.\n", flush=True)
+    log.info("Ready — polling every %ds. Press Ctrl-C to stop.\n", POLL_INTERVAL)
 
     try:
-        while True:
+        while not _shutdown.is_set():
             conn = _ensure_conn(conn)
             _conn_holder["conn"] = conn
 
@@ -232,21 +255,26 @@ def main():
 
             if job is None:
                 set_status(conn, "idle")
-                time.sleep(POLL_INTERVAL)
+                _shutdown.wait(POLL_INTERVAL)
                 continue
 
             job_id, video_id = job
             set_status(conn, "busy")
-            print(f"[worker] Claimed job {job_id}: {video_id}", flush=True)
+            log.info("Claimed job %d: %s", job_id, video_id)
 
             meta = fetch_video_meta(video_id)
-            print(f"[worker] Title: {meta.get('title') or video_id}", flush=True)
+            log.info("Title: %s", meta.get('title') or video_id)
 
             # Fresh connection per job — long jobs (hours) would kill a shared conn
             proc_conn = _new_conn()
             try:
-                stats = process_video(proc_conn, model, model_size, meta,
-                                      log=lambda *a, **kw: print(*a, flush=True, **kw))
+                def _log_fn(*args, **kwargs):
+                    kwargs.pop("flush", None)
+                    kwargs.pop("end", None)
+                    msg = " ".join(str(a) for a in args)
+                    log.info(msg)
+
+                stats = process_video(proc_conn, model, model_size, meta, log=_log_fn)
                 conn = _ensure_conn(conn)
                 _conn_holder["conn"] = conn
                 complete_job(conn, job_id)
@@ -255,11 +283,11 @@ def main():
                                  stats["transcribe_secs"],
                                  stats["word_count"])
                 wpm = round(stats["word_count"] / stats["transcribe_secs"] * 60) if stats["transcribe_secs"] else 0
-                print(f"[worker] Job {job_id} complete — "
-                      f"{stats['word_count']} words in {stats['transcribe_secs']}s "
-                      f"({wpm} WPM).\n", flush=True)
+                log.info("Job %d complete — %d words in %ds (%d WPM).",
+                         job_id, stats['word_count'], stats['transcribe_secs'], wpm)
             except Exception as exc:
-                print(f"[worker] Job {job_id} failed: {exc}", flush=True)
+                log.error("Job %d failed: %s", job_id, exc)
+                log.debug("Traceback:\n%s", traceback.format_exc())
                 conn = _ensure_conn(conn)
                 _conn_holder["conn"] = conn
                 fail_job(conn, job_id, str(exc))
@@ -270,13 +298,14 @@ def main():
                     pass
 
     except KeyboardInterrupt:
-        print("\n[worker] Shutting down ...", flush=True)
+        log.info("Shutting down ...")
     finally:
         try:
             set_status(conn, "offline")
             conn.close()
         except Exception:
             pass
+        log.info("Worker stopped.")
 
 
 if __name__ == "__main__":

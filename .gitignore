@@ -7,6 +7,8 @@ __pycache__/
 *.wav
 *.webm
 *.m4a
+*.log
 .claude/
 test_out.txt
-venv
+venv/
+.venv/

@@ -9,14 +9,25 @@ from pgvector.psycopg2 import register_vector
 
 
 def get_connection():
-    database_url = os.environ["DATABASE_URL"]
-    # Bootstrap: run schema on plain connection first (vector type may not exist yet)
-    bootstrap = psycopg2.connect(database_url)
-    schema_sql = (Path(__file__).parent.parent / "schema.sql").read_text(encoding="utf-8")
-    with bootstrap.cursor() as cur:
-        cur.execute(schema_sql)
-    bootstrap.commit()
-    bootstrap.close()
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL not set. Add it to your .env file.\n"
+            "Example: DATABASE_URL=postgresql://user:password@localhost:5432/sahil_ai"
+        )
+    try:
+        # Bootstrap: run schema on plain connection first (vector type may not exist yet)
+        bootstrap = psycopg2.connect(database_url)
+        schema_sql = (Path(__file__).parent.parent / "schema.sql").read_text(encoding="utf-8")
+        with bootstrap.cursor() as cur:
+            cur.execute(schema_sql)
+        bootstrap.commit()
+        bootstrap.close()
+    except psycopg2.OperationalError as exc:
+        raise RuntimeError(
+            f"Cannot connect to database: {exc}\n"
+            "Check that DATABASE_URL is correct and PostgreSQL is running with pgvector installed."
+        ) from exc
     # Fresh connection with pgvector registered + TCP keepalives so Railway
     # doesn't kill idle connections during long audio-download/split phases.
     conn = psycopg2.connect(
@@ -88,7 +99,31 @@ def upsert_chunks(conn, video_id: str, chunks: list):
     conn.commit()
 
 
-def search_chunks(conn, embedding: list, top_k: int = 5) -> list:
+def get_processed_video_ids(conn, video_ids: list) -> set:
+    """Return subset of video_ids that are already processed."""
+    if not video_ids:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT video_id FROM videos
+            WHERE video_id = ANY(%s) AND processed = TRUE
+        """, (list(video_ids),))
+        return {row[0] for row in cur.fetchall()}
+
+
+def get_queued_video_ids(conn, video_ids: list) -> set:
+    """Return subset of video_ids that are already in the job queue."""
+    if not video_ids:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT video_id FROM job_queue
+            WHERE video_id = ANY(%s)
+        """, (list(video_ids),))
+        return {row[0] for row in cur.fetchall()}
+
+
+def search_chunks(conn, embedding: list, top_k: int = 10, min_similarity: float = 0.3) -> list:
     vec = np.array(embedding, dtype=np.float32)
     with conn.cursor() as cur:
         cur.execute(
@@ -102,7 +137,8 @@ def search_chunks(conn, embedding: list, top_k: int = 5) -> list:
             (vec, vec, top_k),
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    return [r for r in rows if r["similarity"] >= min_similarity]
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +264,48 @@ def record_benchmark(conn, worker_id: str, job_id: int, video_id: str,
         """, (worker_id, job_id, video_id, model_size,
               audio_duration_secs, transcribe_secs, word_count, round(wpm, 1)))
     conn.commit()
+
+
+def get_channel_progress(conn) -> list:
+    """Per-channel progress: total vs processed video count."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT v.channel,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN v.processed THEN 1 ELSE 0 END) AS done
+            FROM videos v
+            WHERE v.channel IS NOT NULL
+            GROUP BY v.channel
+            ORDER BY v.channel
+        """)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def get_avg_processing_time(conn) -> float:
+    """Average transcription seconds per video (last 24h)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT AVG(transcribe_secs) FROM worker_benchmarks
+            WHERE created_at > NOW() - INTERVAL '24 hours'
+        """)
+        row = cur.fetchone()
+        return float(row[0]) if row and row[0] else 0.0
+
+
+def get_active_jobs(conn) -> list:
+    """Jobs currently being processed, with worker and video info."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT j.worker_id, j.video_id, v.title, j.started_at,
+                   EXTRACT(EPOCH FROM (NOW() - j.started_at)) AS elapsed_secs
+            FROM job_queue j
+            LEFT JOIN videos v ON v.video_id = j.video_id
+            WHERE j.status = 'processing'
+            ORDER BY j.started_at
+        """)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def get_benchmarks(conn) -> list:

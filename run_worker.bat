@@ -29,9 +29,16 @@ if errorlevel 1 (
 echo [Setup] Dependencies OK.
 echo.
 
-:: Launch worker
+:: Launch worker with auto-restart on crash
+:restart
 python worker.py
+if %ERRORLEVEL% EQU 0 goto :done
+echo.
+echo Worker crashed (exit %ERRORLEVEL%). Restarting in 5 seconds...
+timeout /t 5 /nobreak >nul
+goto :restart
 
+:done
 echo.
 echo Worker stopped.
 pause

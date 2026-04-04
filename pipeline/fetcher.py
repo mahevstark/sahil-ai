@@ -70,7 +70,8 @@ def fetch_video_meta(video_id: str) -> dict:
     fallback = {"video_id": video_id, "title": video_id, "channel": None,
                 "url": url, "duration": None, "uploaded_at": None}
     r = subprocess.run(
-        [_YTDLP, "--dump-json", "--no-playlist", url],
+        [_YTDLP, "--dump-json", "--no-playlist",
+         "--extractor-args", "youtube:player_client=android_vr", url],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if r.returncode != 0:
@@ -118,6 +119,7 @@ def download_audio(video_id: str, output_dir: Path, log=print) -> Path:
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [_progress_hook],
+        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",

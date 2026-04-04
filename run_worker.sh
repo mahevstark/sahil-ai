@@ -40,8 +40,16 @@ pip3 install -r requirements.txt -q
 echo "[Setup] Dependencies OK."
 echo
 
-# Launch worker
-python3 worker.py
-
-echo
-echo "Worker stopped."
+# Launch worker with auto-restart on crash
+RESTART_DELAY=5
+while true; do
+    echo "[$(date)] Starting worker..."
+    python3 worker.py
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "[$(date)] Worker exited cleanly."
+        break
+    fi
+    echo "[$(date)] Worker crashed (exit $EXIT_CODE). Restarting in ${RESTART_DELAY}s..."
+    sleep $RESTART_DELAY
+done
